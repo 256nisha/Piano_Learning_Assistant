@@ -1,0 +1,277 @@
+/Use of AI / Cognitive Assistance Software is not allowed in any evaluation, assessment or exercise./
+/*=============================================================================
+	File Name:  KEYLUMINATE.c
+	Author:     Nishaben Desai
+	Date:       18/03/2025
+	Modified:   None
+	  Fanshawe College, 2025
+
+	Description: This program runs on an ESP32 using ESP-IDF and controls a piano
+	LED guide system. It manages button inputs, updates an LCD screen,
+	and uses an LED strip to light up notes of songs for user interaction.
+=============================================================================*/
+
+// Libraries ==================================================================
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "sdkconfig.h"
+#include "string.h"
+
+#include "led_strip.h"
+#include "hd44780.h"
+#include "i2c-lcd1602.h"
+
+// Constants  =================================================================
+#define NUM_KEYS 40
+#define LEDS_PER_KEY 2
+#define TOTAL_LEDS (NUM_KEYS * LEDS_PER_KEY)
+#define LED_PIN 19
+
+#define PLAY_BUTTON_PIN 0
+#define SONG_BUTTON_PIN 39
+#define TEMPO_BUTTON_PIN 40
+#define DEBOUNCE_DELAY_MS 200
+
+// LED Strip and LCD Handle ===================================================
+led_strip_handle_t led_strip;
+i2c_lcd1602_info_t * lcd_info = NULL;
+
+// Enumeration ================================================================
+typedef enum {
+    E2 = 0, F2, F2s, G2, G2s, A2_, A2s, B2,
+    C3, C3s, D3, D3s, E3, F3, F3s, G3, G3s, A3_, A3s, B3,
+    C4, C4s, D4, D4s, E4, F4, F4s, G4, G4s, A4_, A4s, B4,
+    C5, C5s, D5, D5s, E5, F5, F5s, G5
+} PianoKey;
+
+#define LED_INDEX(key) ((key) * LEDS_PER_KEY)
+
+// Song Data ==================================================================
+int happyBirthdayMelody[] = {C4, C4, D4, C4, F4, E4, C4, C4, D4, C4, G4, F4, C4, C4, C5, A4_, F4, E4, D4, A4s, A4s, A4_, F4, G4, F4};
+int happyBirthdayDurations[] = {400, 400, 400, 400, 400, 800, 400, 400, 400, 400, 400, 800, 400, 400, 400, 400, 400, 400, 800, 400, 400, 400, 400, 400, 800};
+
+int twinkleMelody[] = {C4, C4, G4, G4, A4_, A4_, G4, F4, F4, E4, E4, D4, D4, C4};
+int twinkleDurations[] = {400, 400, 400, 400, 400, 400, 800, 400, 400, 400, 400, 400, 400, 800};
+
+int jingleBellsMelody[] = {E4, E4, E4, E4, E4, E4, E4, G4, C4, D4, E4};
+int jingleBellsDurations[] = {300, 300, 600, 300, 300, 600, 300, 300, 300, 300, 800};
+
+const char *songNames[] = {"Happy Birthday", "Twinkle Twinkle", "Jingle Bells"};
+const char *tempoNames[] = {"Normal", "Fast", "Slow"};
+
+// Global Variables ===========================================================
+int currentSong = 0;
+bool isPlaying = false;
+bool songChanged = false;
+int tempoLevel = 0;
+float tempoMultipliers[] = {1.0, 1.5, 0.5};
+
+uint64_t lastPlayBtnTime = 0;
+uint64_t lastSongBtnTime = 0;
+uint64_t lastTempoBtnTime = 0;
+
+// Functions ==================================================================
+
+/*>>> delay_ms: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Delay helper using FreeRTOS delay
+Input:      int ms - delay time in milliseconds
+Returns:    None
+===========================================================================*/
+static void delay_ms(int ms) {
+    vTaskDelay(ms / portTICK_PERIOD_MS);
+}
+
+/*>>> lightKey: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Light up LED for a specific piano key.
+Input:      keyIndex (int), r/g/b (color values)
+Returns:    None
+===========================================================================*/
+static void lightKey(int keyIndex, uint32_t r, uint32_t g, uint32_t b) {
+    if (keyIndex < 0 || keyIndex >= NUM_KEYS) return;
+    for (int j = 0; j < LEDS_PER_KEY; j++) {
+        led_strip_set_pixel(led_strip, LED_INDEX(keyIndex) + j, r, g, b);
+    }
+    led_strip_refresh(led_strip);
+}
+
+/*>>> clearKey: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Turn off LED for a specific piano key.
+Input:      keyIndex (int)
+Returns:    None
+===========================================================================*/
+static void clearKey(int keyIndex) {
+    if (keyIndex < 0 || keyIndex >= NUM_KEYS) return;
+    for (int j = 0; j < LEDS_PER_KEY; j++) {
+        led_strip_set_pixel(led_strip, LED_INDEX(keyIndex) + j, 0, 0, 0);
+    }
+    led_strip_refresh(led_strip);
+}
+
+/*>>> flashAll: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Flash all LEDs for a moment with a given color.
+Input:      r/g/b (color), duration in ms
+Returns:    None
+===========================================================================*/
+static void flashAll(uint8_t r, uint8_t g, uint8_t b, int duration_ms) {
+    for (int i = 0; i < TOTAL_LEDS; i++) {
+        led_strip_set_pixel(led_strip, i, r, g, b);
+    }
+    led_strip_refresh(led_strip);
+    delay_ms(duration_ms);
+    led_strip_clear(led_strip);
+    led_strip_refresh(led_strip);
+}
+
+/*>>> updateLCD: =============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Update LCD with current song and play/tempo status.
+Input:      None
+Returns:    None
+===========================================================================*/
+static void updateLCD() {
+    char line1[17];
+    char line2[17];
+    snprintf(line1, sizeof(line1), "%s", songNames[currentSong]);
+    snprintf(line2, sizeof(line2), "%s  %s", isPlaying ? "Playing" : "Paused", tempoNames[tempoLevel]);
+
+    i2c_lcd1602_clear(lcd_info);
+    i2c_lcd1602_write_string(lcd_info, line1);
+    i2c_lcd1602_move_cursor(lcd_info, 0, 1);
+    i2c_lcd1602_write_string(lcd_info, line2);
+}
+
+/*>>> checkButtons: ===========================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Handle button press events with debounce logic.
+Input:      None
+Returns:    None
+===========================================================================*/
+static void checkButtons() {
+    uint64_t now = esp_timer_get_time() / 1000;
+
+    if (!gpio_get_level(PLAY_BUTTON_PIN) && now - lastPlayBtnTime > DEBOUNCE_DELAY_MS) {
+        isPlaying = !isPlaying;
+        lastPlayBtnTime = now;
+        updateLCD();
+    }
+
+    if (!gpio_get_level(SONG_BUTTON_PIN) && now - lastSongBtnTime > DEBOUNCE_DELAY_MS) {
+        currentSong = (currentSong + 1) % 3;
+        lastSongBtnTime = now;
+        songChanged = true;
+        updateLCD();
+        flashAll(128, 0, 128, 300);
+        isPlaying = true;
+    }
+
+    if (!gpio_get_level(TEMPO_BUTTON_PIN) && now - lastTempoBtnTime > DEBOUNCE_DELAY_MS) {
+        tempoLevel = (tempoLevel + 1) % 3;
+        lastTempoBtnTime = now;
+        updateLCD();
+        flashAll(200, 0, 200, 200);
+    }
+}
+
+/*>>> playSong: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Play the selected song's melody with LED light effects.
+Input:      melody array, durations array, length, r/g/b values
+Returns:    None
+===========================================================================*/
+static void playSong(const int *melody, const int *durations, int length, uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < length; i++) {
+        checkButtons();
+        if (!isPlaying || songChanged) {
+            songChanged = false;
+            return;
+        }
+
+        int note = melody[i];
+        int duration = durations[i];
+
+        lightKey(note, r, g, b);
+        delay_ms(duration / tempoMultipliers[tempoLevel]);
+        clearKey(note);
+        delay_ms(100 / tempoMultipliers[tempoLevel]);
+    }
+    isPlaying = false;
+}
+
+/*>>> app_main: ==============================================================
+Author:     Nishaben Desai
+Date:       18/03/2025
+Modified:   None
+Desc:       Entry point for ESP-IDF application. Initializes hardware and 
+            manages playback loop.
+Input:      None
+Returns:    None
+===========================================================================*/
+void app_main(void) {
+    // GPIO Configuration
+    gpio_set_direction(PLAY_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PLAY_BUTTON_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_direction(SONG_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(SONG_BUTTON_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_direction(TEMPO_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(TEMPO_BUTTON_PIN, GPIO_PULLUP_ONLY);
+
+    // LED Strip Initialization
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_PIN,
+        .max_leds = TOTAL_LEDS,
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags = 0,
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags = 0,
+    };
+    led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
+    led_strip_clear(led_strip);
+
+    // LCD Initialization
+    lcd_info = i2c_lcd1602_malloc();
+    i2c_lcd1602_init(lcd_info, 0x27, I2C_NUM_0, 16, 2);
+    i2c_lcd1602_reset(lcd_info);
+    i2c_lcd1602_clear(lcd_info);
+    i2c_lcd1602_write_string(lcd_info, "Key-Luminate");
+    delay_ms(1000);
+    i2c_lcd1602_clear(lcd_info);
+
+    // Main Loop
+    while (1) {
+        checkButtons();
+        if (currentSong == 0)
+            playSong(happyBirthdayMelody, happyBirthdayDurations, sizeof(happyBirthdayMelody)/sizeof(int), 255, 150, 0);
+        else if (currentSong == 1)
+            playSong(twinkleMelody, twinkleDurations, sizeof(twinkleMelody)/sizeof(int), 0, 255, 200);
+        else if (currentSong == 2)
+            playSong(jingleBellsMelody, jingleBellsDurations, sizeof(jingleBellsMelody)/sizeof(int), 255, 0, 0);
+
+        delay_ms(100);
+    }
+} // eo app_main::
