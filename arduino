@@ -1,0 +1,259 @@
+#include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal.h>
+
+#define NUM_KEYS 40
+#define LEDS_PER_KEY 2
+#define TOTAL_LEDS (NUM_KEYS * LEDS_PER_KEY)
+#define LED_PIN 19
+#define PLAY_BUTTON_PIN 0
+#define SONG_BUTTON_PIN 39
+#define TEMPO_BUTTON_PIN 40
+
+Adafruit_NeoPixel strip(TOTAL_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+LiquidCrystal lcd(4, 5, 15, 16, 17, 18);
+
+// Avoid ESP32 analog pin conflicts
+typedef enum 
+{
+  E2 = 0, F2, F2s, G2, G2s, A2_, A2s, B2,
+  C3, C3s, D3, D3s, E3, F3, F3s, G3, G3s, A3_, A3s, B3,
+  C4, C4s, D4, D4s, E4, F4, F4s, G4, G4s, A4_, A4s, B4,
+  C5, C5s, D5, D5s, E5, F5, F5s, G5
+} PianoKey;
+
+#define LED_INDEX(key) ((key) * LEDS_PER_KEY)
+
+// Happy Birthday
+const int happyBirthdayMelody[] = 
+{
+  C4, C4, D4, C4, F4, E4,
+  C4, C4, D4, C4, G4, F4,
+  C4, C4, C5, A4_, F4, E4, D4,
+  A4s, A4s, A4_, F4, G4, F4
+};
+const int happyBirthdayDurations[] = 
+{
+  400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 800
+};
+
+// Twinkle Twinkle
+const int twinkleMelody[] = 
+{
+  C4, C4, G4, G4, A4_, A4_, G4,
+  F4, F4, E4, E4, D4, D4, C4,
+  G4, G4, F4, F4, E4, E4, D4,
+  G4, G4, F4, F4, E4, E4, D4,
+  C4, C4, G4, G4, A4_, A4_, G4,
+  F4, F4, E4, E4, D4, D4, C4
+};
+const int twinkleDurations[] = 
+{
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800,
+  400, 400, 400, 400, 400, 400, 800
+};
+
+// ------------------ SONG 3: Jingle Bells ------------------
+const int jingleBellsMelody[] = 
+{
+  E4, E4, E4, E4, E4, E4,
+  E4, G4, C4, D4, E4,
+  F4, F4, F4, F4, F4, E4, E4, E4, E4,
+  D4, D4, E4, D4, G4
+};
+
+const int jingleBellsDurations[] = 
+{
+  300, 300, 600, 300, 300, 600,
+  300, 300, 300, 300, 800,
+  300, 300, 300, 300, 300, 300, 300, 300, 600,
+  300, 300, 300, 300, 1000
+};
+
+// lcd data
+const char* songNames[] = {
+  "Happy Birthday",
+  "Twinkle Twinkle",
+  "Jingle Bells"
+};
+
+const char* tempoNames[] = {
+  "Normal", "Fast", "Slow"
+};
+
+const char* noteNames[NUM_KEYS] = {
+  "E2", "F2", "F#2", "G2", "G#2", "A2", "A#2", "B2",
+  "C3", "C#3", "D3", "D#3", "E3", "F3", "F#3", "G3", "G#3", "A3", "A#3", "B3",
+  "C4", "C#4", "D4", "D#4", "E4", "F4", "F#4", "G4", "G#4", "A4", "A#4", "B4",
+  "C5", "C#5", "D5", "D#5", "E5", "F5", "F#5", "G5"
+};
+
+
+int currentSong = 0;
+bool isPlaying = false;
+unsigned long lastPlayBtnTime = 0;
+unsigned long lastSongBtnTime = 0;
+const unsigned long debounceDelay = 200;
+bool songChanged = false;
+int tempoLevel = 0;  // 0 = normal, 1 = fast, 2 = slow
+float tempoMultipliers[] = {1.0, 1.5, 0.5};
+
+unsigned long lastTempoBtnTime = 0;
+
+void setup() 
+{
+  pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SONG_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TEMPO_BUTTON_PIN, INPUT_PULLUP);
+  strip.begin();
+  strip.setBrightness(100);
+  strip.show();
+ //lcd
+ lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("Key-Luminate");
+  delay(1000);
+  lcd.clear();
+
+
+}
+
+void lightKey(int keyIndex, uint32_t color) 
+{
+  if (keyIndex < 0 || keyIndex >= NUM_KEYS) return;
+  int i = LED_INDEX(keyIndex);
+  strip.setPixelColor(i, color);
+  strip.setPixelColor(i + 1, color);
+  strip.show();
+}
+
+void clearKey(int keyIndex) 
+{
+  if (keyIndex < 0 || keyIndex >= NUM_KEYS) return;
+  int i = LED_INDEX(keyIndex);
+  strip.setPixelColor(i, 0);
+  strip.setPixelColor(i + 1, 0);
+  strip.show();
+}
+
+void checkButtons() {
+  // Play/Pause
+  if (digitalRead(PLAY_BUTTON_PIN) == LOW && millis() - lastPlayBtnTime > debounceDelay) 
+  {
+    isPlaying = !isPlaying;
+    lastPlayBtnTime = millis();
+    updateLCD();
+
+  }
+
+  // Song Change
+  if (digitalRead(SONG_BUTTON_PIN) == LOW && millis() - lastSongBtnTime > debounceDelay) 
+  {
+    currentSong = (currentSong + 1) % 3;
+    lastSongBtnTime = millis();
+    songChanged = true;
+    updateLCD();
+
+
+  // Flash all LEDs purple briefly
+  for (int i = 0; i < TOTAL_LEDS; i++) 
+  {
+    strip.setPixelColor(i, strip.Color(18, 35, 18));
+  }
+  strip.show();
+  delay(300);
+  strip.clear();
+  strip.show();
+
+  isPlaying = true; // Auto-play the new song
+  }
+  
+  // Tempo Change Button
+  if (digitalRead(TEMPO_BUTTON_PIN) == LOW && millis() - lastTempoBtnTime > debounceDelay) 
+  {
+    tempoLevel = (tempoLevel + 1) % 3; // cycle through 0,1,2
+    lastTempoBtnTime = millis();
+    updateLCD();
+
+    // Flash all LEDs briefly in purple to indicate tempo change
+    for (int i = 0; i < TOTAL_LEDS; i++) {
+      strip.setPixelColor(i, strip.Color(200, 0, 200));
+    }
+    strip.show();
+    delay(200);
+    strip.clear();
+    strip.show();
+  }
+}
+
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(songNames[currentSong]);
+
+  lcd.setCursor(0, 1);
+  lcd.print(isPlaying ? "Playing  " : "Paused   ");
+  lcd.print(tempoNames[tempoLevel]);
+}
+
+void playSong(const int* melody, const int* durations, int length, uint32_t color) 
+{
+  for (int i = 0; i < length; i++) 
+  {
+    checkButtons();
+    if (!isPlaying || songChanged) 
+    {
+    songChanged = false; // reset for next loop
+    return;
+    }
+
+    
+    
+
+    int note = melody[i];
+    int duration = durations[i];
+    int nextNote = (i + 1 < length) ? melody[i + 1] : -1; // -1 if no next note
+
+    lcd.setCursor(0, 1);
+    lcd.print("Now: ");
+    lcd.print(noteNames[note]);
+    lcd.print("  Next:");
+    if (nextNote >= 0) 
+    {
+      lcd.print(noteNames[nextNote]);
+    } 
+    else 
+    {
+      lcd.print("None");
+    }
+    lcd.print("  "); // Clear extra chars
+
+    lightKey(note, color);
+
+    delay(duration / tempoMultipliers[tempoLevel]);
+
+    clearKey(note);
+    delay(100 / tempoMultipliers[tempoLevel]);
+
+  }
+  isPlaying = false;
+}
+
+void loop() {
+  checkButtons();
+
+  if (currentSong == 0) {
+  playSong(happyBirthdayMelody, happyBirthdayDurations, sizeof(happyBirthdayMelody)/sizeof(int), strip.Color(255, 150, 0)); // Orange
+} else if (currentSong == 1) {
+  playSong(twinkleMelody, twinkleDurations, sizeof(twinkleMelody)/sizeof(int), strip.Color(0, 255, 200)); // Cyan
+} else if (currentSong == 2) {
+  playSong(jingleBellsMelody, jingleBellsDurations, sizeof(jingleBellsMelody)/sizeof(int), strip.Color(255, 0, 0)); // Red
+}
+
+}
